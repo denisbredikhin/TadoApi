@@ -1,5 +1,7 @@
-﻿using Newtonsoft.Json;
+﻿using KoenZomers.Tado.Api.Entities;
+using Newtonsoft.Json;
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -22,15 +24,25 @@ namespace KoenZomers.Tado.Api
         /// </summary>
         public string Password { get; private set; }
 
+        private readonly Uri tadoApiXBaseUrl = new Uri("https://hops.tado.com/");
+
         /// <summary>
         /// Base Uri with which all Tado API requests start
         /// </summary>
-        public Uri TadoApiBaseUrl => new Uri("https://my.tado.com/api/v2/");
+        private readonly Uri tadoApiBaseUrl = new Uri("https://my.tado.com/api/v2/");        
+
+        private Dictionary<int, Uri> apiUriPerHome = new Dictionary<int, Uri>();
+        private Dictionary<string, Uri> apiUriPerDevice = new Dictionary<string, Uri>();
+
+        private Uri GetApiUri(int homeId) => apiUriPerHome.ContainsKey(homeId) ? apiUriPerHome[homeId] : tadoApiBaseUrl;
+        private Uri GetApiOfDevice(string deviceId) => apiUriPerDevice.ContainsKey(deviceId) ? apiUriPerDevice[deviceId] : tadoApiBaseUrl;
+
+        private bool IsX(int homeId) => apiUriPerHome.ContainsKey(homeId) && apiUriPerHome[homeId] == tadoApiXBaseUrl;
 
         /// <summary>
         /// Tado API Uri to authenticate against
         /// </summary>
-        public Uri TadoApiAuthUrl => new Uri("https://auth.tado.com/oauth/token");
+        public Uri TadoApiAuthUrl => new Uri("https://auth.tado.com/oauth/token");        
 
         /// <summary>
         /// Tado API Client Id to use for the OAuth token
@@ -45,7 +57,7 @@ namespace KoenZomers.Tado.Api
         /// <summary>
         /// Allows setting an User Agent which will be provided to the Tado API
         /// </summary>
-        public string UserAgent => "";
+        public string UserAgent => "PostmanRuntime/7.42.0";
 
         private IWebProxy proxyConfiguration;
         /// <summary>
@@ -54,7 +66,14 @@ namespace KoenZomers.Tado.Api
         public IWebProxy ProxyConfiguration
         {
             get { return proxyConfiguration; }
-            set { proxyConfiguration = value; _httpClient?.Dispose(); _httpClient = CreateHttpClient(); }
+            set { 
+                proxyConfiguration = value;
+                foreach (var httpClient in _httpClientPerEndpoint.Values)
+                    httpClient.Dispose();
+                _httpClientPerEndpoint[tadoApiBaseUrl] = CreateHttpClient();
+                _httpClientPerEndpoint[tadoApiXBaseUrl] = CreateHttpClient();
+                _httpClientPerEndpoint[TadoApiAuthUrl] = CreateHttpClient();
+            }
         }
 
         private NetworkCredential proxyCredential;
@@ -64,7 +83,13 @@ namespace KoenZomers.Tado.Api
         public NetworkCredential ProxyCredential
         {
             get { return proxyCredential; }
-            set { proxyCredential = value; _httpClient?.Dispose(); _httpClient = CreateHttpClient(); }
+            set { proxyCredential = value;
+                foreach (var httpClient in _httpClientPerEndpoint.Values)
+                    httpClient.Dispose();
+                _httpClientPerEndpoint[tadoApiBaseUrl] = CreateHttpClient();
+                _httpClientPerEndpoint[tadoApiXBaseUrl] = CreateHttpClient();
+                _httpClientPerEndpoint[TadoApiAuthUrl] = CreateHttpClient();
+            }
         }
 
         /// <summary>
@@ -84,7 +109,16 @@ namespace KoenZomers.Tado.Api
         /// <summary>
         /// HttpClient to use for network communications towards the Tado API
         /// </summary>
-        private HttpClient _httpClient;
+        private Dictionary<Uri, HttpClient> _httpClientPerEndpoint = new Dictionary<Uri, HttpClient>();
+
+        private HttpClient GetHttpClient(Uri uri) 
+        {
+            foreach (var pair in _httpClientPerEndpoint) {
+                if (uri.ToString().StartsWith(pair.Key.ToString()))
+                    return pair.Value;
+            }
+            return null;
+        }
 
         #endregion
 
@@ -99,7 +133,9 @@ namespace KoenZomers.Tado.Api
             Password = password;
 
             // Add a HttpClient to the session to allow for network communication
-            _httpClient = CreateHttpClient();
+            _httpClientPerEndpoint[tadoApiBaseUrl] = CreateHttpClient();
+            _httpClientPerEndpoint[tadoApiXBaseUrl] = CreateHttpClient();
+            _httpClientPerEndpoint[TadoApiAuthUrl] = CreateHttpClient();            
         }
 
         /// <summary>
@@ -107,7 +143,8 @@ namespace KoenZomers.Tado.Api
         /// </summary>
         public void Dispose()
         {
-            _httpClient?.Dispose();
+            foreach (var httpClient in _httpClientPerEndpoint.Values)
+                httpClient.Dispose();
         }
 
         #endregion
@@ -142,8 +179,9 @@ namespace KoenZomers.Tado.Api
                 }
             }
 
-            // Set the access token on the HttpClient
-            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("bearer", AuthenticatedSession.AccessToken);
+            foreach (var httpClient in _httpClientPerEndpoint.Values)
+                // Set the access token on the HttpClient
+                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("bearer", AuthenticatedSession.AccessToken);
         }
 
         /// <summary>
@@ -172,7 +210,9 @@ namespace KoenZomers.Tado.Api
             queryBuilder.Add("scope", "home.user");
             queryBuilder.Add("username", Username);
 
-            return await PostMessageGetResponse<Entities.Session>(TadoApiAuthUrl, queryBuilder, false);
+            var result = await PostMessageGetResponse<Entities.Session>(TadoApiAuthUrl, queryBuilder, false);
+
+            return result;
         }
 
         /// <summary>
@@ -206,6 +246,16 @@ namespace KoenZomers.Tado.Api
             {
                 throw new Exceptions.SessionAuthenticationFailedException(ex);
             }
+
+            if (apiUriPerHome.Count == 0)
+            {
+                var me = await GetMe();
+                foreach (var homeShortInfo in me.Homes)
+                {
+                    var home = await GetHome((int)homeShortInfo.Id);
+                    apiUriPerHome[(int)home.Id] = home.Generation == "LINE_X" ? tadoApiXBaseUrl : tadoApiBaseUrl;
+                }
+            }
         }
 
         #endregion
@@ -223,6 +273,7 @@ namespace KoenZomers.Tado.Api
             {
                 UseDefaultCredentials = ProxyCredential == null,
                 Proxy = ProxyConfiguration,
+                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
             };
             if(ProxyConfiguration != null)
             {
@@ -243,7 +294,12 @@ namespace KoenZomers.Tado.Api
                 // Identify to the server with a specific User Agent
                 httpClient.DefaultRequestHeaders.Add("User-Agent", UserAgent);
             }
-            
+            httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
+            httpClient.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip")); 
+            httpClient.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("deflate"));
+            httpClient.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("br"));
+
+
             return httpClient;
         }
 
@@ -280,7 +336,7 @@ namespace KoenZomers.Tado.Api
                     try
                     {
                         // Request the response from the webservice
-                        var response = await _httpClient.SendAsync(request);
+                        var response = await GetHttpClient(uri).SendAsync(request);
                         var responseBody = await response.Content.ReadAsStringAsync();
 
                         // Verify if the request was successful (response status 200-299)
@@ -320,7 +376,7 @@ namespace KoenZomers.Tado.Api
                 try
                 {
                     // Request the response from the webservice
-                    using (var response = await _httpClient.SendAsync(request))
+                    using (var response = await GetHttpClient(uri).SendAsync(request))
                     {
                         if (!expectedHttpStatusCode.HasValue || (expectedHttpStatusCode.HasValue && response != null && response.StatusCode == expectedHttpStatusCode.Value))
                         {
@@ -369,7 +425,7 @@ namespace KoenZomers.Tado.Api
                     try
                     {
                         // Request the response from the webservice
-                        using (var response = await _httpClient.SendAsync(request))
+                        using (var response = await GetHttpClient(uri).SendAsync(request))
                         {
                             if (!expectedHttpStatusCode.HasValue || (expectedHttpStatusCode.HasValue && response != null && response.StatusCode == expectedHttpStatusCode.Value))
                             {
@@ -418,7 +474,7 @@ namespace KoenZomers.Tado.Api
                     try
                     {
                         // Request the response from the webservice
-                        using (var response = await _httpClient.SendAsync(request))
+                        using (var response = await GetHttpClient(uri).SendAsync(request))
                         {
                             if (!expectedHttpStatusCode.HasValue || (expectedHttpStatusCode.HasValue && response != null && response.StatusCode == expectedHttpStatusCode.Value))
                             {
@@ -448,7 +504,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.User>(new Uri(TadoApiBaseUrl, "me"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.User>(new Uri(GetApiUri(0), "me"), HttpStatusCode.OK);
             return response;
         }
 
@@ -461,7 +517,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.Zone[]>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/zones"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.Zone[]>(new Uri(GetApiUri(homeId), IsX(homeId) ? $"homes/{homeId}/rooms" : $"homes/{homeId}/zones"), HttpStatusCode.OK);
             return response;
         }
 
@@ -474,7 +530,14 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.Device[]>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/devices"), HttpStatusCode.OK);
+            var apiUri = GetApiUri(homeId);
+            var response = await GetMessageReturnResponse<Entities.Device[]>(new Uri(apiUri, $"homes/{homeId}/devices"), HttpStatusCode.OK);
+
+            foreach (var device in response)
+            {
+                apiUriPerDevice[device.ShortSerialNo] = apiUri;
+            }
+
             return response;
         }
 
@@ -487,7 +550,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.MobileDevice.Item[]>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/mobileDevices"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.MobileDevice.Item[]>(new Uri(GetApiUri(homeId), $"homes/{homeId}/mobileDevices"), HttpStatusCode.OK);
             return response;
         }
 
@@ -501,7 +564,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.MobileDevice.Settings>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/mobileDevices/{mobileDeviceId}/settings"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.MobileDevice.Settings>(new Uri(GetApiUri(homeId), $"homes/{homeId}/mobileDevices/{mobileDeviceId}/settings"), HttpStatusCode.OK);
             return response;
         }
 
@@ -514,7 +577,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.Installation[]>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/installations"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.Installation[]>(new Uri(GetApiUri(homeId), $"homes/{homeId}/installations"), HttpStatusCode.OK);
             return response;
         }
 
@@ -527,7 +590,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.HomeState>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/state"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.HomeState>(new Uri(GetApiUri(homeId), $"homes/{homeId}/state"), HttpStatusCode.OK);
             return response;
         }
 
@@ -541,7 +604,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.State>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/zones/{zoneId}/state"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.State>(new Uri(GetApiUri(homeId), $"homes/{homeId}/zones/{zoneId}/state"), HttpStatusCode.OK);
             return response;
         }
 
@@ -556,7 +619,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            return SendMessage("{}", HttpMethod.Post, new Uri(TadoApiBaseUrl, $"homes/{homeId}/zones/{zoneId}/state/openWindow/activate"), HttpStatusCode.NoContent);
+            return SendMessage("{}", HttpMethod.Post, new Uri(GetApiUri(homeId), $"homes/{homeId}/zones/{zoneId}/state/openWindow/activate"), HttpStatusCode.NoContent);
         }
 
         /// <summary>
@@ -569,7 +632,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            return SendMessage("{}", HttpMethod.Delete, new Uri(TadoApiBaseUrl, $"homes/{homeId}/zones/{zoneId}/state/openWindow"), HttpStatusCode.NoContent);
+            return SendMessage("{}", HttpMethod.Delete, new Uri(GetApiUri(homeId), $"homes/{homeId}/zones/{zoneId}/state/openWindow"), HttpStatusCode.NoContent);
         }
 
         /// <summary>
@@ -582,7 +645,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.ZoneSummary>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/zones/{zoneId}/overlay"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.ZoneSummary>(new Uri(GetApiUri(homeId), $"homes/{homeId}/zones/{zoneId}/overlay"), HttpStatusCode.OK);
             return response;
         }
 
@@ -595,7 +658,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.Weather>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/weather"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.Weather>(new Uri(GetApiUri(homeId), $"homes/{homeId}/weather"), HttpStatusCode.OK);
             return response;
         }
 
@@ -608,7 +671,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.House>(new Uri(TadoApiBaseUrl, $"homes/{homeId}"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.House>(new Uri(GetApiUri(homeId), $"homes/{homeId}"), HttpStatusCode.OK);
             return response;
         }
 
@@ -621,7 +684,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.User[]>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/users"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.User[]>(new Uri(GetApiUri(homeId), $"homes/{homeId}/users"), HttpStatusCode.OK);
             return response;
         }
 
@@ -635,7 +698,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.Capability>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/zones/{zoneId}/capabilities"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.Capability>(new Uri(GetApiUri(homeId), $"homes/{homeId}/zones/{zoneId}/capabilities"), HttpStatusCode.OK);
             return response;
         }
 
@@ -649,7 +712,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.EarlyStart>(new Uri(TadoApiBaseUrl, $"homes/{homeId}/zones/{zoneId}/earlyStart"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.EarlyStart>(new Uri(GetApiUri(homeId), $"homes/{homeId}/zones/{zoneId}/earlyStart"), HttpStatusCode.OK);
             return response;
         }
 
@@ -792,7 +855,7 @@ namespace KoenZomers.Tado.Api
 
             var request = JsonConvert.SerializeObject(overlay);
 
-            var response = await SendMessageReturnResponse<Entities.ZoneSummary>(request, HttpMethod.Put, new Uri(TadoApiBaseUrl, $"homes/{homeId}/zones/{zoneId}/overlay"), HttpStatusCode.OK);
+            var response = await SendMessageReturnResponse<Entities.ZoneSummary>(request, HttpMethod.Put, new Uri(GetApiUri(homeId), $"homes/{homeId}/zones/{zoneId}/overlay"), HttpStatusCode.OK);
             return response;
         }
 
@@ -888,7 +951,7 @@ namespace KoenZomers.Tado.Api
 
             var request = JsonConvert.SerializeObject(new { homePresence = presence.ToString().ToUpperInvariant() });
 
-            return await SendMessage(request, HttpMethod.Put, new Uri(TadoApiBaseUrl, $"homes/{homeId}/presenceLock"), HttpStatusCode.NoContent);
+            return await SendMessage(request, HttpMethod.Put, new Uri(GetApiUri(homeId), $"homes/{homeId}/presenceLock"), HttpStatusCode.NoContent);
         }
 
         /// <summary>
@@ -920,7 +983,7 @@ namespace KoenZomers.Tado.Api
             };
             var request = JsonConvert.SerializeObject(earlyStart);
 
-            var response = await SendMessageReturnResponse<Entities.EarlyStart>(request, HttpMethod.Put, new Uri(TadoApiBaseUrl, $"homes/{homeId}/zones/{zoneId}/earlyStart"), HttpStatusCode.OK);
+            var response = await SendMessageReturnResponse<Entities.EarlyStart>(request, HttpMethod.Put, new Uri(GetApiUri(homeId), $"homes/{homeId}/zones/{zoneId}/earlyStart"), HttpStatusCode.OK);
             return response;
         }
 
@@ -933,7 +996,7 @@ namespace KoenZomers.Tado.Api
         {
             EnsureAuthenticatedSession();
 
-            var success = await SendMessage(null, HttpMethod.Post, new Uri(TadoApiBaseUrl, $"devices/{deviceId}/identify"), HttpStatusCode.OK);
+            var success = await SendMessage(null, HttpMethod.Post, new Uri(GetApiOfDevice(deviceId), $"devices/{deviceId}/identify"), HttpStatusCode.OK);
             return success;
         }
 
@@ -961,7 +1024,7 @@ namespace KoenZomers.Tado.Api
 
             var request = JsonConvert.SerializeObject(new { childLockEnabled = enableChildLock });
 
-            return await SendMessage(request, HttpMethod.Put, new Uri(TadoApiBaseUrl, $"devices/{deviceId}/childLock"), HttpStatusCode.NoContent);
+            return await SendMessage(request, HttpMethod.Put, new Uri(GetApiOfDevice(deviceId), $"devices/{deviceId}/childLock"), HttpStatusCode.NoContent);
         }
 
         #region Zone Temperature Offset
@@ -980,7 +1043,7 @@ namespace KoenZomers.Tado.Api
 
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.Temperature>(new Uri(TadoApiBaseUrl, $"devices/{deviceId}/temperatureOffset"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.Temperature>(new Uri(GetApiOfDevice(deviceId), $"devices/{deviceId}/temperatureOffset"), HttpStatusCode.OK);
             return response;
         }
 
@@ -995,10 +1058,9 @@ namespace KoenZomers.Tado.Api
             {
                 throw new ArgumentNullException(nameof(device));
             }
-
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.Temperature>(new Uri(TadoApiBaseUrl, $"devices/{device.ShortSerialNo}/temperatureOffset"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.Temperature>(new Uri(GetApiOfDevice(device.ShortSerialNo), $"devices/{device.ShortSerialNo}/temperatureOffset"), HttpStatusCode.OK);
             return response;
         }
 
@@ -1020,7 +1082,7 @@ namespace KoenZomers.Tado.Api
 
             EnsureAuthenticatedSession();
 
-            var response = await GetMessageReturnResponse<Entities.Temperature>(new Uri(TadoApiBaseUrl, $"devices/{zone.Devices[0].ShortSerialNo}/temperatureOffset"), HttpStatusCode.OK);
+            var response = await GetMessageReturnResponse<Entities.Temperature>(new Uri(GetApiOfDevice(zone.Devices[0].ShortSerialNo), $"devices/{zone.Devices[0].ShortSerialNo}/temperatureOffset"), HttpStatusCode.OK);
             return response;
         }
 
@@ -1036,7 +1098,7 @@ namespace KoenZomers.Tado.Api
 
             var request = JsonConvert.SerializeObject(new { celsius = temperature });
 
-            return await SendMessage(request, HttpMethod.Put, new Uri(TadoApiBaseUrl, $"devices/{deviceId}/temperatureOffset"), HttpStatusCode.OK);
+            return await SendMessage(request, HttpMethod.Put, new Uri(GetApiOfDevice(deviceId), $"devices/{deviceId}/temperatureOffset"), HttpStatusCode.OK);
         }
 
         /// <summary>
@@ -1082,7 +1144,7 @@ namespace KoenZomers.Tado.Api
 
             var request = JsonConvert.SerializeObject(new { fahrenheit = temperature });
 
-            return await SendMessage(request, HttpMethod.Put, new Uri(TadoApiBaseUrl, $"devices/{deviceId}/temperatureOffset"), HttpStatusCode.OK);
+            return await SendMessage(request, HttpMethod.Put, new Uri(GetApiOfDevice(deviceId), $"devices/{deviceId}/temperatureOffset"), HttpStatusCode.OK);
         }
 
         /// <summary>
