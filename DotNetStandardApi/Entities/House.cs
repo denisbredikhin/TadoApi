@@ -48,5 +48,8 @@ namespace KoenZomers.Tado.Api.Entities
 
         [JsonProperty("geolocation")]
         public Geolocation Geolocation { get; set; }
+
+        [JsonProperty("generation")]
+        public string Generation { get; set; }
     }
 }
